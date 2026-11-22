@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    name: Host tests (native sources, QMP client, helper runner)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tests/run.sh
+
+  apk:
+    name: Build APK
+    runs-on: ubuntu-24.04
+    needs: host-tests
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+      KS_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Locate Android SDK tools (preinstalled on the runner)
+        run: |
+          SDKM="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)"
+          echo "sdkmanager: $SDKM"
+          echo "SDKMANAGER=$SDKM" >> "$GITHUB_ENV"
+          yes | "$SDKM" --licenses >/dev/null || true
+
+      - name: Install SDK platform, build-tools, NDK, CMake
+        run: |
+          NDK="$(grep -oP 'ndkVersion = "\K[^"]+' app/build.gradle.kts)"
+          if ! "$SDKMANAGER" --list 2>/dev/null | grep -q "ndk;$NDK "; then
+            ALT="$("$SDKMANAGER" --list 2>/dev/null | grep -oE 'ndk;29\.[0-9.]+' | sort -V | tail -1 | cut -d';' -f2)"
+            [ -n "$ALT" ] || { echo "::error::no NDK 29.x available"; exit 1; }
+            echo "::warning::pinned NDK $NDK not available, using $ALT"
+            sed -i "s/ndkVersion = \"$NDK\"/ndkVersion = \"$ALT\"/" app/build.gradle.kts
+            NDK="$ALT"
+          fi
+          echo "using NDK $NDK"
+          "$SDKMANAGER" "platforms;android-36" "build-tools;36.0.0" "ndk;$NDK" "cmake;3.22.1"
+
+      - name: Fetch prebuilt payloads (libqemu.so, helper VM) from release "payloads"
+        run: |
+          mkdir -p app/src/main/jniLibs/arm64-v8a app/src/main/assets/helper
+          fetch() {
+            if gh release download payloads -R "$GITHUB_REPOSITORY" -p "$1" -D "$RUNNER_TEMP" --clobber 2>/dev/null; then
+              unzip -oq "$RUNNER_TEMP/$1" -d "$2" && echo "fetched $1"
+            else
+              echo "::warning::$1 not found in release 'payloads': the APK builds but cannot boot a VM (run the matching payload workflow)"
+            fi
+          }
+          fetch qemu-libs.zip     app/src/main/jniLibs/arm64-v8a
+          fetch helper-assets.zip app/src/main/assets/helper
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"      # AGP 8.11.x needs Gradle >= 8.13. Commit a wrapper to drop this pin.
+
+      - name: Assemble debug APK
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Assemble signed release APK (tags, when keystore secrets exist)
+        if: startsWith(github.ref, 'refs/tags/v') && env.KS_B64 != ''
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          KEYSTORE_FILE="$RUNNER_TEMP/release.jks" gradle --no-daemon --stacktrace assembleRelease
+
+      - name: Report native payloads inside the APK
+        run: |
+          apk="$(ls app/build/outputs/apk/debug/*.apk | head -1)"
+          unzip -l "$apk" | grep -E 'lib/arm64-v8a/|assets/helper/' || true
+          unzip -l "$apk" | grep -q 'libqemu.so' || echo "::warning::libqemu.so is not in the APK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: iosvm-apk
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+
+  release:
+    name: GitHub release (tags)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: apk
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: iosvm-apk
+          path: apks
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: apks/**/*.apk
+          generate_release_notes: true
