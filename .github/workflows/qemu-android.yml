@@ -1,0 +1,106 @@
+name: QEMU libs (Android arm64)
+
+# Cross-builds libqemu.so + libqemuimg.so from YOUR fork of the Apple-SoC QEMU.
+# The fork must already carry the iosvm hook-ups (qemu-patches/README.md: t8030.c, meson, qapi);
+# this workflow copies the new source files, verifies the hook-ups exist, then builds.
+on:
+  workflow_dispatch:
+    inputs:
+      fork_repo:
+        description: "Fork with the iosvm hook-ups committed (owner/name)"
+        required: true
+      fork_ref:
+        description: "Branch / tag / SHA"
+        required: true
+        default: main
+      publish:
+        description: "Upload qemu-libs.zip to the 'payloads' release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      API: "33"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.fork_repo }}
+          ref: ${{ inputs.fork_ref }}
+          path: qemu-src
+          submodules: recursive
+          token: ${{ secrets.FORK_TOKEN || github.token }}     # set FORK_TOKEN if the fork is private
+
+      - name: Host build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build meson pkg-config python3-venv flex bison cmake autoconf automake libtool zip
+
+      - name: Locate Android SDK tools (preinstalled on the runner)
+        run: |
+          SDKM="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)"
+          echo "sdkmanager: $SDKM"
+          echo "SDKMANAGER=$SDKM" >> "$GITHUB_ENV"
+          yes | "$SDKM" --licenses >/dev/null || true
+
+      - name: Install NDK
+        run: |
+          NDK="$(grep -oP 'ndkVersion = "\K[^"]+' app/build.gradle.kts)"
+          if ! "$SDKMANAGER" --list 2>/dev/null | grep -q "ndk;$NDK "; then
+            ALT="$("$SDKMANAGER" --list 2>/dev/null | grep -oE 'ndk;29\.[0-9.]+' | sort -V | tail -1 | cut -d';' -f2)"
+            [ -n "$ALT" ] || { echo "::error::no NDK 29.x available"; exit 1; }
+            echo "::warning::pinned NDK $NDK not available, using $ALT"
+            sed -i "s/ndkVersion = \"$NDK\"/ndkVersion = \"$ALT\"/" app/build.gradle.kts
+            NDK="$ALT"
+          fi
+          "$SDKMANAGER" "ndk;$NDK"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK" >> "$GITHUB_ENV"
+
+      - name: Copy iosvm sources into the fork and verify hook-ups
+        run: |
+          QEMU_SRC="$PWD/qemu-src" bash qemu-patches/apply.sh >/dev/null
+          grep -rq ios_vm_bridge_init_dram qemu-src/hw/arm --include='*.c' --exclude=ios_vm_bridge.c \
+            || { echo "::error::no ios_vm_bridge_init_dram() call in hw/arm: the t8030.c hook-up is missing in the fork"; exit 1; }
+          grep -q "ios-vm.json" qemu-src/qapi/qapi-schema.json \
+            || { echo "::error::qapi-schema.json does not include ios-vm.json"; exit 1; }
+
+      - name: Cache cross-built dependencies
+        id: deps
+        uses: actions/cache@v4
+        with:
+          path: out/deps
+          key: android-deps-api${{ env.API }}-${{ hashFiles('tools/build-deps-android.sh') }}
+
+      - name: Build dependencies (glib, pixman, libffi, pcre2)
+        if: steps.deps.outputs.cache-hit != 'true'
+        run: bash tools/build-deps-android.sh
+
+      - name: Build QEMU
+        run: |
+          QEMU_SRC="$PWD/qemu-src" DEPS_PREFIX="$PWD/out/deps" JNILIBS="$PWD/out/jniLibs" \
+            bash tools/build-qemu-android.sh
+
+      - name: Package
+        run: |
+          cd out/jniLibs && zip -j ../../qemu-libs.zip libqemu.so libqemuimg.so
+          file libqemu.so || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qemu-libs
+          path: qemu-libs.zip
+
+      - name: Publish to release "payloads"
+        if: inputs.publish
+        run: |
+          gh release view payloads >/dev/null 2>&1 || gh release create payloads --prerelease \
+            --title "payloads" --notes "Prebuilt payloads consumed by CI (qemu-libs.zip, helper-assets.zip)."
+          gh release upload payloads qemu-libs.zip --clobber
