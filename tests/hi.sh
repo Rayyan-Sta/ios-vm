@@ -1,3 +1,0 @@
-#!/bin/bash
-
-echo "Just a dummy file"
