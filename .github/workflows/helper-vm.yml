@@ -1,0 +1,82 @@
+name: Helper VM payload
+
+# Builds Image.gz (4K), Image16k.gz (16K), initrd.gz and the manifest into helper-assets.zip.
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Upload helper-assets.zip to the 'payloads' release"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths: ["helper/**"]
+
+permissions:
+  contents: write
+
+env:
+  LINUX_VER: "6.12.30"
+  KERNEL_CACHE_REV: "1"        # bump to force a kernel rebuild
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail fast if helper/build-helper-vm.sh is the old version
+        run: |
+          grep -q 'STAGE="${STAGE:-all}"' helper/build-helper-vm.sh || {
+            echo "::error file=helper/build-helper-vm.sh::Old script: it has no STAGE support. Replace it with the new build-helper-vm.sh and commit to main."
+            exit 1
+          }
+
+      - name: Build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu make bc flex bison libssl-dev libelf-dev \
+            cpio xz-utils curl zip qemu-user-static binfmt-support
+
+      # Kernels take ~25 min and don't depend on the initrd: cache them on their own.
+      - name: Restore kernel cache
+        id: kcache
+        uses: actions/cache/restore@v4
+        with:
+          path: app/src/main/assets/helper/Image*.gz
+          key: helper-kernels-${{ env.LINUX_VER }}-${{ env.KERNEL_CACHE_REV }}
+
+      - name: Build kernels (4K + 16K pages)
+        if: steps.kcache.outputs.cache-hit != 'true'
+        run: STAGE=kernels LINUX_VER="$LINUX_VER" bash helper/build-helper-vm.sh
+
+      - name: Save kernel cache
+        if: steps.kcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: app/src/main/assets/helper/Image*.gz
+          key: helper-kernels-${{ env.LINUX_VER }}-${{ env.KERNEL_CACHE_REV }}
+
+      - name: Build initrd (Alpine rootfs + tools)
+        run: sudo -E env "PATH=$PATH" STAGE=initrd bash helper/build-helper-vm.sh
+
+      - name: Package
+        run: |
+          sudo chown -R "$USER" app/src/main/assets/helper out 2>/dev/null || true
+          ls -lh app/src/main/assets/helper
+          zip -j helper-assets.zip app/src/main/assets/helper/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helper-assets
+          path: helper-assets.zip
+
+      - name: Publish to release "payloads"
+        if: inputs.publish
+        run: |
+          gh release view payloads >/dev/null 2>&1 || gh release create payloads --prerelease \
+            --title "payloads" --notes "Prebuilt payloads consumed by CI (qemu-libs.zip, helper-assets.zip)."
+          gh release upload payloads helper-assets.zip --clobber
