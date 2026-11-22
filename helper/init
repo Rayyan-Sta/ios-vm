@@ -1,0 +1,15 @@
+#!/bin/sh
+export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts /run /tmp /work /var/run
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+stty -F /dev/ttyAMA0 raw -echo 2>/dev/null
+ip link set lo up
+ip link set eth0 up 2>/dev/null && udhcpc -i eth0 -q -n -t 3 >/dev/null 2>&1
+( usbmuxd -f -U root || usbmuxd -f ) >/tmp/usbmuxd.log 2>&1 &
+sleep 1
+python3 /opt/asoft/asoft_runner.py <>/dev/ttyAMA0 >&0 2>&1
+poweroff -f

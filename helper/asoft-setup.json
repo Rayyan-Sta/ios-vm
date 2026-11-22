@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "name": "ios16-iphone12,1-restore",
+  "target": { "machine": "t8030", "board": "n104ap", "product": "iPhone12,1" },
+  "vars": {
+    "work": "/work",
+    "ipsw": "/work/ipsw",
+    "fw": "/work/fw",
+    "tools": "/opt/asoft"
+  },
+  "stages": [
+    {
+      "id": "A",
+      "title": "Extract IPSW, decrypt components, forge tickets, export boot artifacts",
+      "steps": [
+        { "id": "mkwork",  "type": "mkfs_mount", "dev": "/dev/vdb", "mount": "{work}" },
+        { "id": "unzip",   "type": "unzip_dev",  "dev": "/dev/vda", "dest": "{ipsw}" },
+        { "id": "resolve", "type": "resolve_components",
+          "manifest": "{ipsw}/BuildManifest.plist", "board": "n104ap", "behavior": "Erase" },
+
+        { "id": "kernelcache", "type": "img4_decrypt", "component": "KernelCache",        "out": "{fw}/kernelcache.bin" },
+        { "id": "devicetree",  "type": "img4_decrypt", "component": "DeviceTree",         "out": "{fw}/devicetree.bin" },
+        { "id": "ramdisk",     "type": "img4_decrypt", "component": "RestoreRamDisk",     "out": "{fw}/ramdisk.bin" },
+        { "id": "trustcache",  "type": "img4_decrypt", "component": "RestoreTrustCache",  "out": "{fw}/trustcache.bin" },
+        { "id": "sep-raw",     "type": "img4_decrypt", "component": "RestoreSEP",         "out": "{work}/sep-firmware.raw", "key_required": true },
+
+        { "id": "forge-tickets", "type": "exec",
+          "argv": ["{tools}/user/forge-tickets.sh", "{ipsw}", "n104ap", "{work}/sep-firmware.raw", "{fw}"],
+          "note": "USER-SUPPLIED. Must leave {fw}/ticket.der and {fw}/sep-fw.img4. See helper/user-scripts/README.md" },
+
+        { "id": "export", "type": "export_tar", "files": [
+          { "src": "{fw}/kernelcache.bin", "name": "kernelcache.bin" },
+          { "src": "{fw}/devicetree.bin",  "name": "devicetree.bin" },
+          { "src": "{fw}/ramdisk.bin",     "name": "ramdisk.bin" },
+          { "src": "{fw}/trustcache.bin",  "name": "trustcache.bin" },
+          { "src": "{fw}/ticket.der",      "name": "ticket.der" },
+          { "src": "{fw}/sep-fw.img4",     "name": "sep-fw.img4" }
+        ] }
+      ]
+    },
+    {
+      "id": "B",
+      "title": "Restore iOS over emulated USB",
+      "wait_for_host": true,
+      "steps": [
+        { "id": "wait-usb", "type": "wait_usb", "vendor": "05ac", "timeout": 900 },
+        { "id": "restore", "type": "exec",
+          "argv": ["idevicerestore", "--erase", "--restore-mode", "-i", "0x1122334455667788",
+                   "-T", "{fw}/ticket.der", "{ipsw}"] }
+      ]
+    },
+    {
+      "id": "C",
+      "title": "Filesystem patches (optional, user-supplied)",
+      "wait_for_host": true,
+      "steps": [
+        { "id": "fs-patches", "type": "exec", "optional": true,
+          "argv": ["{tools}/user/fs-patches.sh"],
+          "note": "Needs a writable APFS driver in the helper kernel; otherwise patch offline on macOS." }
+      ]
+    }
+  ]
+}

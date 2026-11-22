@@ -1,0 +1,32 @@
+# -*- Mode: Python -*-
+# vim: filetype=python
+
+##
+# @IosVmInfo:
+#
+# Guest memory / display geometry for the host app's zero-copy renderer.
+#
+# @dram-base: guest-physical address where DRAM starts
+# @dram-size: DRAM size in bytes
+# @fb-valid: whether a framebuffer has been configured yet
+# @fb-base: guest-physical address of the framebuffer
+# @fb-width: width in pixels
+# @fb-height: height in pixels
+# @fb-stride: bytes per row
+# @fb-format: "bgra8888" or "rgba8888" (byte order in memory)
+#
+# Since: 9.0
+##
+{ 'struct': 'IosVmInfo',
+  'data': { 'dram-base': 'uint64', 'dram-size': 'uint64', 'fb-valid': 'bool',
+            'fb-base': 'uint64', 'fb-width': 'uint32', 'fb-height': 'uint32',
+            'fb-stride': 'uint32', 'fb-format': 'str' } }
+
+##
+# @x-ios-vm-info:
+#
+# Returns: @IosVmInfo
+#
+# Since: 9.0
+##
+{ 'command': 'x-ios-vm-info', 'returns': 'IosVmInfo' }
